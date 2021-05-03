@@ -1,0 +1,615 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: 'Bring your own Model Artifacts with AWS Batch using SageMaker'
+
+Parameters:
+  S3BootstrapBucket:
+    Type: String
+    Description: Name of the S3 Buckets for bootstrapping assets.
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      "ImageRepo": "811284229777.dkr.ecr.us-east-1.amazonaws.com/xgboost:1"
+    us-east-2:
+      "ImageRepo": "825641698319.dkr.ecr.us-east-2.amazonaws.com/xgboost:1"
+    us-west-1:
+      "ImageRepo": "685385470294.dkr.ecr.us-west-1.amazonaws.com/xgboost:1"
+    us-west-2:
+      "ImageRepo": "433757028032.dkr.ecr.us-west-2.amazonaws.com/xgboost:1"
+
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 Security Group for instances launched in the VPC by Batch
+      VpcId:
+        Ref: VPC
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      VpcId:
+        Ref: VPC
+      MapPublicIpOnLaunch: 'True'
+
+  Route:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId:
+        Ref: InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: RouteTable
+      SubnetId:
+        Ref: Subnet
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # RoleName:
+      #   Fn::Sub: lambda-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonKinesisFullAccess
+        - arn:aws:iam::aws:policy/AWSBatchFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'codebuild:StartBuild'
+                Resource: !GetAtt
+                  - ContainerBuildProject
+                  - Arn
+              - Effect: Allow
+                Action:
+                  - 'ecr:*'
+                Resource: !Sub >-
+                  arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${BatchProcessRepository}
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: batch.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  IamInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - Ref: EcsInstanceRole
+
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2008-10-17'
+        Statement:
+        - Sid: ''
+          Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+
+  BatchProcessingJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: BatchJobDefinition
+      ContainerProperties:
+        Image:
+          Fn::Join:
+          - ''
+          - - Ref: AWS::AccountId
+            - .dkr.ecr.
+            - Ref: AWS::Region
+            - ".amazonaws.com/batch-processing-job-repository:latest"
+        Vcpus: 8
+        Memory: 16000
+        Command:
+        - python
+        - batch_processor.py
+      RetryStrategy:
+        Attempts: 1
+
+  BatchProcessingJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: BatchProcessingJobQueue
+      Priority: 1
+      ComputeEnvironmentOrder:
+      - Order: 1
+        ComputeEnvironment:
+          Ref: ComputeEnvironment
+
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        # DesiredvCpus: 0
+        DesiredvCpus: 16
+        MaxvCpus: 96
+        InstanceTypes:
+          - c5.4xlarge
+          # - optimal
+        Subnets:
+        - Ref: Subnet
+        SecurityGroupIds:
+        - Ref: SecurityGroup
+        InstanceRole:
+          Ref: IamInstanceProfile
+      ServiceRole:
+        Ref: BatchServiceRole
+
+  BatchProcessS3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: BatchProcessBucketPermission
+    Properties:
+      BucketName:
+          !Sub 'batch-processing-job-${AWS::Region}-${AWS::AccountId}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:*'
+          Filter:
+            S3Key:
+              Rules:
+                - Name: prefix
+                  Value: input/
+                - Name: suffix
+                  Value: .csv
+          Function: !GetAtt BatchProcessingLambdaInvokeFunction.Arn
+
+  BatchProcessBucketPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref BatchProcessingLambdaInvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:aws:s3:::batch-processing-job-${AWS::Region}-${AWS::AccountId}"
+
+  BatchProcessingLambdaInvokeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BatchProcessingLambdaInvokeFunction
+      Description: Python Function Handler that would be triggered BY s3 events TO the aws batch
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt
+        - LambdaExecutionRole
+        - Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              inputFileName = ""
+              bucketName = ""
+
+              for record in event['Records']:
+                bucketName = record['s3']['bucket']['name']
+                inputFileName = record['s3']['object']['key']
+
+              response = {
+                  'statusCode': 200,
+                  'body': json.dumps('Input Received - ' + json.dumps(event))
+              }
+
+              batch = boto3.client('batch')
+              region = batch.meta.region_name
+
+              batchCommand = "--bucketName " + bucketName  + " --fileName " + inputFileName + " --region " + region
+
+              out = "Input FileName:  "+bucketName+"/"+inputFileName+" Region: " + region
+              logger.info(out)
+
+              response = batch.submit_job(jobName='BatchProcessingJobQueue',
+                                          jobQueue='BatchProcessingJobQueue',
+                                          jobDefinition='BatchJobDefinition',
+                                          containerOverrides={
+                                              "command": [ "python", "batch_processor.py", batchCommand  ],
+                                              "environment": [
+                                                  {"name": "INPUT_BUCKET", "value": bucketName},
+                                                  {"name": "FILE_NAME", "value": inputFileName},
+                                                  {"name": "REGION", "value": region}
+                                              ]
+                                          })
+
+              logger.info("AWS Batch Job ID is {}.".format(response['jobId']))
+              return response
+
+  StartContainerBuild:
+    Type: 'Custom::StartContainerBuild'
+    Properties:
+      ServiceToken: !GetAtt
+        - ContainerBuildLambda
+        - Arn
+      ProjectName: !Ref ContainerBuildProject
+      EcrRepository: !Ref BatchProcessRepository
+
+  ContainerBuildLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.6
+      Description: Batch Processing Container CodeBuild Project
+      Role: !GetAtt
+        - LambdaExecutionRole
+        - Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import botocore
+          import boto3
+          import logging
+          import traceback
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def start_build(properties):
+              # Start the Container CodeBuild Job
+              codebuild = boto3.client('codebuild')
+              project_name = properties.get('ProjectName')
+              response = codebuild.start_build(projectName=project_name)
+              return response
+
+          def lambda_handler(event, context):
+              logger.debug('Event: {}'.format(event)) #debug
+              logger.debug('Context: {}'.format(context)) #debug
+              properties = event['ResourceProperties']
+              responseData = {}
+
+              if event['RequestType'] == 'Create':
+                  # Trigger the CodeBuild project upon cfn creation
+                  try:
+                      start_build_response = start_build(properties)
+                      logger.info('Successfully started container build: {}'.format(start_build_response))
+                      responseData = {'Success': 'Container build project '+properties.get('ProjectName')+' successfully started ...'}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, 'CustomResourcePhysicalID')
+                  except Exception as e:
+                      logger.error(e, exc_info=True)
+                      responseData = {'Error': traceback.format_exc(e)}
+                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData, 'CustomResourcePhysicalID')
+
+              if event['RequestType'] == 'Delete':
+                  # Delete the ECR Repository upon cfn deletion
+                  try:
+                      ecr = boto3.client('ecr')
+                      ecr.delete_repository(repositoryName=properties.get('EcrRepository'), force=True)
+                      logger.info('delete ecr repository completed ...')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, 'CustomResourcePhysicalID')
+                  except Exception as e:
+                      logger.error(e, exc_info=True)
+                      responseData = {'Error': traceback.format_exc(e)}
+                      cfnresponse.send(event, context, cfnresponse.FAILED, responseData, 'CustomResourcePhysicalID')
+
+  ContainerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: batch-processing-job-build
+      Description: Batch processing container build project
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: S3
+        Location: !Sub '${S3BootstrapBucket}/artifacts/container-src.zip'
+        BuildSpec: !Sub |
+          version: 0.2
+
+          phases:
+            install:
+              runtime-versions:
+                python: 3.7
+            pre_build:
+              commands:
+                - printenv
+                - echo Logging in to Amazon ECR ...
+                - $(aws ecr get-login --region $AWS_DEFAULT_REGION --no-include-email)
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - docker build -t $REPOSITORY_URI .
+                - docker tag $REPOSITORY_URI $REPOSITORY_URI
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Push the latest Docker Image...
+                - docker push $REPOSITORY_URI
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:1.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+            - Name: REPOSITORY_URI
+              Type: PLAINTEXT
+              Value:
+                Fn::Join:
+                - ''
+                - - Ref: AWS::AccountId
+                  - .dkr.ecr.
+                  - Ref: AWS::Region
+                  - ".amazonaws.com/batch-processing-job-repository:latest"
+            - Name: AWS_DEFAULT_REGION
+              Type: PLAINTEXT
+              Value:
+                Ref: AWS::Region
+      TimeoutInMinutes: 10
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AWSCodeCommitFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [codebuild.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'logs:*'
+                - 'ec2:CreateNetworkInterface'
+                - 'ec2:DescribeNetworkInterfaces'
+                - 'ec2:DeleteNetworkInterface'
+                - 'ec2:DescribeSubnets'
+                - 'ec2:DescribeSecurityGroups'
+                - 'ec2:DescribeDhcpOptions'
+                - 'ec2:DescribeVpcs'
+                - 'ec2:CreateNetworkInterfacePermission'
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:PutImage'
+                - 'ecr:InitiateLayerUpload'
+                - 'ecr:UploadLayerPart'
+                - 'ecr:CompleteLayerUpload'
+                - 'codebuild:BatchGetBuilds'
+                Effect: Allow
+                Resource: '*'
+
+  BatchProcessRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: "batch-processing-job-repository"
+      RepositoryPolicyText:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Sid: AllowPushPull
+            Effect: Allow
+            Principal:
+              AWS:
+               - !Sub arn:aws:iam::${AWS::AccountId}:role/${EcsInstanceRole}
+            Action:
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+
+  BatchProcessingDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BatchProcessingJob
+      AttributeDefinitions:
+        -
+          AttributeName: "FileName"
+          AttributeType: "S"
+        -
+          AttributeName: "StartTime"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "FileName"
+          KeyType: "HASH"
+      GlobalSecondaryIndexes:
+        -
+          IndexName: "GSI"
+          KeySchema:
+            -
+              AttributeName: "StartTime"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "KEYS_ONLY"
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  Model:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: Detection
+      PrimaryContainer:
+        Image: !FindInMap [RegionMap, !Ref "AWS::Region", ImageRepo]
+        ModelDataUrl: !Sub s3://${S3BootstrapBucket}/artifacts/model.tar.gz
+      ExecutionRoleArn: !GetAtt SageMakerRole.Arn
+
+  EndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      ProductionVariants:
+      - InitialInstanceCount: 2
+        InitialVariantWeight: 1.0
+        InstanceType: ml.m4.xlarge
+        ModelName: !GetAtt Model.ModelName
+        VariantName: !GetAtt Model.ModelName
+      EndpointConfigName: Detection-Config
+      Tags:
+        - Key: Name
+          Value: Detection-Config
+    DependsOn: Model
+
+  Endpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: Detection-EndPoint
+      EndpointConfigName: !GetAtt EndpointConfig.EndpointConfigName
+      Tags:
+        - Key: Name
+          Value: Detection-EndPoint
+    DependsOn: EndpointConfig
+
+  AutoScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 2
+      ResourceId: endpoint/Detection-EndPoint/variant/Detection
+      RoleARN: !GetAtt SageMakerRole.Arn
+      ScalableDimension: sagemaker:variant:DesiredInstanceCount
+      ServiceNamespace: sagemaker
+    DependsOn: Endpoint
+
+  AutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: SageMakerVariantInvocationsPerInstance
+      PolicyType: TargetTrackingScaling
+      ResourceId: endpoint/Detection-EndPoint/variant/Detection
+      ScalableDimension: sagemaker:variant:DesiredInstanceCount
+      ServiceNamespace: sagemaker
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 150.0
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: SageMakerVariantInvocationsPerInstance
+    DependsOn: AutoScaling
+
+  SageMakerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2008-10-17'
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+Outputs:
+
+  ComputeEnvironmentArn:
+    Value:
+      Ref: ComputeEnvironment
+
+  BatchProcessingJobQueueArn:
+    Value:
+      Ref: BatchProcessingJobQueue
+
+  BatchProcessingJobDefinitionArn:
+    Value:
+      Ref: BatchProcessingJobDefinition
+
+  BucketName:
+    Value:
+      Ref: BatchProcessS3Bucket
+
+  LambdaName:
+    Value:
+      Ref: BatchProcessingLambdaInvokeFunction
+
+  BatchProcessingTableName:
+    Value:
+      Ref: BatchProcessingDynamoDBTable

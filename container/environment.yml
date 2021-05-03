@@ -1,0 +1,14 @@
+name: AWSBatch
+channels:
+    - conda-forge
+dependencies:
+    - python==3.6.7
+    - numpy
+    - pillow
+    - ffmpeg
+    - imageio
+    - pyqt=4.11.4
+    - pip:
+        - opencv-python
+        - requests
+        - boto3
